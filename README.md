@@ -1,55 +1,138 @@
-# fdtd_gpu: CUDA-Accelerated 2D FDTD Simulation
+# CUDAwave — CUDA-Accelerated 2D FDTD Simulation
+
+> **GSoC Proof-of-Work:** A fully GPU-accelerated 2D FDTD solver with TF/SF boundary injection and an on-device 1D DPW auxiliary grid — achieving **83x speedup** over CPU on a Tesla T4.
+
+---
+
+## Results
+
+### Ez Field — Plane Wave Propagation inside TF/SF Boundary
+![Ez Field](images/ez_field.png)
+*Correct plane wave propagation (red/blue = ±Ez). Dashed white rectangle = TF/SF contour. Outside = scattered-field region (near zero). Computed on Tesla T4, 512×512 grid, 2000 timesteps.*
+
+### GPU vs CPU Benchmark — Tesla T4
+![Benchmark](images/benchmark.png)
+
+### Terminal Output
+![Benchmark Terminal](images/Screenshot%202026-03-18%20a...png)
+
+| Grid | Steps | GPU (ms) | CPU (ms) | Speedup |
+|------|-------|----------|----------|---------|
+| 256×256 | 2000 | 134.0 | 4147.2 | **30.95x** |
+| 512×512 | 2000 | 344.8 | 18301.5 | **53.08x** |
+| 1024×1024 | 2000 | 887.4 | 73872.0 | **83.24x** |
+
+**Validation: PASS** — GPU output matches CPU reference (max relative error < 1e-4)
+
+---
 
 ## Overview
-This project implements a 2D Finite-Difference Time-Domain (FDTD) electromagnetic simulation accelerated via CUDA. It serves as a proof-of-work for advanced GPU computational electromagnetics techniques, including TF/SF boundaries and a fully on-device 1D auxiliary grid. It is intended for researchers and students looking for a high-performance baseline.
+
+This project implements a 2D Finite-Difference Time-Domain (FDTD) electromagnetic simulation fully accelerated on GPU via CUDA. It serves as a proof-of-work for a GSoC proposal on GPU-accelerated computational electromagnetics.
+
+**What makes this non-trivial:**
+- The 1D DPW auxiliary grid runs **entirely on-device** — no host memory round-trips
+- TF/SF injection uses 4 separate CUDA kernels with correct ±signs per boundary segment
+- Two CUDA streams overlap H-update and DPW-update for extra throughput
+- Validated numerically against CPU reference before benchmarking
+
+---
 
 ## Physics Background
-- **FDTD**: Solves Maxwell's equations in the time domain using the Yee scheme. Here, we simulate the 2D TE mode (Ez, Hx, Hy).
-- **TF/SF (Total-Field / Scattered-Field)**: A boundary condition that injects an incident wave (e.g., plane wave) into a localized region without affecting the scattered fields outside.
-- **1D DPW**: A Dispersive Plane Wave auxiliary grid is simulated alongside the 2D domain. It computes the exact incident fields for the TF/SF boundary to avoid numerical dispersion mismatches.
+
+**FDTD (Finite-Difference Time-Domain):** Solves Maxwell's equations in the time domain using the Yee scheme. This project simulates 2D TE mode with fields Ez, Hx, Hy in free space at 2.4 GHz.
+
+**TF/SF (Total-Field / Scattered-Field):** A virtual rectangular boundary that injects a known incident plane wave into the simulation. Inside = total field (incident + scattered). Outside = scattered field only. Enables clean scattering analysis without contaminating the far field.
+
+**1D DPW (Dispersive Plane Wave) Auxiliary Grid:** A lightweight 1D FDTD grid that propagates the incident wave analytically on-device. The TF/SF kernels read directly from this device array — zero CPU involvement per timestep.
+
+---
+
+## Project Structure
+
+```
+CUDAwave/
+├── CMakeLists.txt
+├── README.md
+├── include/
+│   ├── common.h          # FDTDParams struct, constants, CHECK_CUDA macro
+│   ├── fdtd2d.cuh        # GPU FDTD kernel declarations
+│   ├── fdtd2d_cpu.h      # CPU reference declarations
+│   ├── dpw.cuh           # 1D DPW auxiliary grid declarations
+│   └── tfsf.cuh          # TF/SF boundary injection declarations
+├── src/
+│   ├── main.cu           # Entry point, CLI parsing, startup banner
+│   ├── fdtd2d.cu         # k_update_h, k_update_e, k_apply_abc kernels
+│   ├── fdtd2d_cpu.cpp    # Unoptimized CPU reference (baseline)
+│   ├── dpw.cu            # k_dpw_update_h, k_dpw_update_e kernels
+│   ├── tfsf.cu           # tfsf_hx_bottom/top, tfsf_hy_left/right kernels
+│   └── benchmark.cu      # cudaEvent timing, CSV output, validation
+├── python/
+│   ├── plot_fields.py    # Ez heatmap with TF/SF contour overlay
+│   └── plot_benchmark.py # GPU vs CPU bar chart + speedup line
+└── images/
+    ├── ez_field.png
+    └── benchmark.png
+```
+
+---
 
 ## Build Instructions
-Prerequisites: CMake >= 3.18, CUDA Toolkit >= 11.0, GCC/Clang.
+
+**Prerequisites:** CUDA Toolkit 11+, CMake 3.18+, GCC 9+
+
 ```bash
+git clone https://github.com/sahilshingate01/CUDAwave.git
+cd CUDAwave
 mkdir build && cd build
-cmake ..
-make
+cmake .. -DCMAKE_CUDA_ARCHITECTURES=75   # 75=T4, 86=RTX30xx, 89=RTX40xx
+make -j$(nproc)
 ```
+
+---
 
 ## Usage
-Run the main executable with different modes:
+
 ```bash
-# Run the full benchmark suite
+# Full benchmark (3 grid sizes, GPU vs CPU table)
 ./fdtd_gpu --mode bench
 
-# Run GPU simulation with custom grid size
+# GPU only with validation
 ./fdtd_gpu --mode gpu --nx 512 --ny 512 --steps 2000
 
-# Run CPU baseline
-./fdtd_gpu --mode cpu
+# CPU only
+./fdtd_gpu --mode cpu --nx 256 --ny 256 --steps 500
 ```
 
-## Sample Output
-- `data/benchmark.csv`: Raw timing data.
-- `data/ez_field.png`: Heatmap of the Ez field snapshot, showing the propagating waves and the TF/SF boundary (white dashed line).
-- `data/benchmark.png`: Bar chart comparing GPU vs. CPU execution times alongside a speedup line.
+**Generate plots:**
+```bash
+cd ..
+pip install matplotlib numpy pandas
+python3 python/plot_fields.py
+python3 python/plot_benchmark.py
+```
+
+---
 
 ## Implementation Notes
-- **Memory Layout**: Uses `cudaMallocPitch` for optimal coalesced memory access of 2D grids, avoiding bank conflicts.
-- **Texture Memory**: The `Ez` field is bound to a 2D texture object (`cudaTextureObject_t`) during the TF/SF update to leverage the GPU's L2 texture cache for spatial locality.
-- **Concurrency**: The 1D DPW update and the 2D H-field update are overlapped using distinct CUDA streams.
-- **1D DPW On-Device**: Running the 1D auxiliary simulation entirely on the device avoids slow CPU-GPU memory transfers each time step.
 
-## Performance Results
-| Grid       | Steps | GPU(ms) | CPU(ms) | Speedup |
-|------------|-------|---------|---------|---------|
-| 256x256    | 2000  | XX.X    | XXX.X   | XX.Xx   |
-| 512x512    | 2000  | XX.X    | XXX.X   | XX.Xx   |
-| 1024x1024  | 2000  | XX.X    | XXX.X   | XX.Xx   |
+| Detail | Choice | Why |
+|--------|--------|-----|
+| Thread blocks | 16×16 | Maximizes occupancy on sm_75 |
+| Field arrays | `cudaMallocPitch` | Avoids shared memory bank conflicts |
+| Incident field | 1D device array | Zero host↔device transfers per step |
+| CUDA streams | 2 streams | Overlaps H-update + DPW-update |
+| Validation | max rel err < 1e-4 | Verifies TF/SF sign correctness |
+| Precision | `float32` | 2x throughput vs double on T4 |
 
-*(Run `./fdtd_gpu --mode bench` to generate actual timings for your system)*
+---
 
-## Roadmap / Next Steps
-- Implement PML (Perfectly Matched Layers) for superior boundary absorption.
-- Extend the simulation to a full 3D domain.
-- Add support for complex permittivity and frequency-dependent materials.
+## Device Info
+
+```
+Device: Tesla T4
+Compute Capability: 7.5
+CUDA Version: 12.8
+```
+
+---
